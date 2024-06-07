@@ -16,9 +16,10 @@ dependencies = [
     "accelerate>=0.30.1",
     "jaxtyping>=0.2.29",
     "matplotlib>=3.9.0",
+    "setuptools>=70.0.0", # necessary for triton 
 ]
 readme = "README.md"
-requires-python = ">= 3.11"
+requires-python = "= 3.11"
 
 [tool.rye]
 managed = true

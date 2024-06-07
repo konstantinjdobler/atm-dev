@@ -57,6 +57,7 @@ def main(
     )
     # MistralForCausalLM
     model.compile()
+    model(torch.randint(10, 300, (10,10)).long().cuda())
 
     new_vocab = {}
     source_vocab = source_tokenizer.get_vocab()
@@ -93,9 +94,8 @@ def main(
             pickle.dump(collected_snippets, f)
     print("Collected snippets for all tokens")
 
-    
     SNIPPET_LEN = 50
-    NUM_SNIPPETS_PER_TOKEN = 50 
+    NUM_SNIPPETS_PER_TOKEN = 50
     new_phrases_ids = []
     new_phrases_snippets_ids = []
     new_phrases_token_ids_in_target_vocab = []
