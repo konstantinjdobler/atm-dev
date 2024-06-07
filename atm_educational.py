@@ -1,4 +1,5 @@
 import copy
+from os import truncate
 from typing import Iterable
 
 import numpy as np
@@ -20,7 +21,7 @@ from atm_utils import SPIECE_WHITESPACE
 LR = 0.05
 WD = 0.0
 BS = 5
-MBS = 200
+MBS = 5
 NUM_TRAIN_SNIPPETS = 50
 NUM_ESTIMATE_PASSES = 50
 NUM_ESTIMATE_PASSES = min(NUM_ESTIMATE_PASSES, NUM_TRAIN_SNIPPETS)
@@ -30,11 +31,13 @@ NEW_PHRASE_STR = " technical debt"
 # NEW_PHRASE_STR = " integer underflow"
 NEW_PHRASE_STR = " thermomechanical material fatigue resistance testing"
 NEW_PHRASE_STR = " hydrogen presence in the intergalactic medium"
+NEW_PHRASE_STR = " is not"
 # NEW_PHRASE_STR = " reionization"
 
 TARGET_LAYER = -1
 
-DATA_GENERATION_PROMPT_TEMPLATE = "{NEW_PHRASE}"
+# DATA_GENERATION_PROMPT_TEMPLATE = "She{NEW_PHRASE}"
+DATA_GENERATION_PROMPT_PREFIX = ""
 USE_SPECIAL_TOKENS = True
 CONCAT_EVERY = -1
 
@@ -86,7 +89,12 @@ def atm_merge_token(new_phrase, tokenizer: PreTrainedTokenizer, model, train_sni
     initial_new_phrase_merged_emb = new_phrase_atm_emb.clone().detach()
 
     # 2) generate snippets with the new token from the model
-    data_generation_prompt_pattern_ids = [tokenizer.bos_token_id] + new_phrase_tokenized_ids.tolist()
+    data_generation_prompt_pattern_ids = []
+    if USE_SPECIAL_TOKENS:
+        data_generation_prompt_pattern_ids.append(tokenizer.bos_token_id)
+    if DATA_GENERATION_PROMPT_PREFIX:
+        data_generation_prompt_pattern_ids += get_new_phrase_tokenized_ids(DATA_GENERATION_PROMPT_PREFIX, tokenizer)[0].tolist()
+    data_generation_prompt_pattern_ids += new_phrase_tokenized_ids.tolist()
     print("-----Sanity prints-----")
     print(
         f"Prompting the model with: {tokenizer.decode(data_generation_prompt_pattern_ids)} | {tokenizer.convert_ids_to_tokens(data_generation_prompt_pattern_ids)}"
@@ -119,6 +127,10 @@ def atm_merge_token(new_phrase, tokenizer: PreTrainedTokenizer, model, train_sni
 
     # 3) ATM optimization
     print(f"Snippet sample tokens: {tokenizer.convert_ids_to_tokens(new_phrase_atm_train_snippets[0]['input_ids'][0])}")
+    print(f"Snippet sample tokens 2: {tokenizer.convert_ids_to_tokens(new_phrase_atm_train_snippets[1]['input_ids'][0])}")
+    print(f"Snippet sample tokens 3: {tokenizer.convert_ids_to_tokens(new_phrase_atm_train_snippets[2]['input_ids'][0])}")
+    print(f"Snippet sample tokens 4: {tokenizer.convert_ids_to_tokens(new_phrase_atm_train_snippets[3]['input_ids'][0])}")
+
     new_phrase_atm_emb = atm_optimization(
         new_phrase_atm_emb,
         model,
@@ -195,7 +207,7 @@ def atm_merge_token(new_phrase, tokenizer: PreTrainedTokenizer, model, train_sni
 
         # 5.1) generate samples with the new token.. but first a baseline
         eval_new_phrase = new_phrase if new_phrase_starts_with_whitespace else f" {new_phrase}"
-        generation_eval_prompt = f"{eval_new_phrase}"
+        generation_eval_prompt = f"Barack Obama{eval_new_phrase}"
         print_eval_generation_results(generation_eval_prompt, model, tokenizer, 3, 50, "Original Tokenization")
 
         # 5.2) generate samples with the new token but using the initial merged embedding
@@ -620,25 +632,46 @@ def generate_samples_with_pattern(
     seed=42,
     max_length=15,
     concat_every=-1,
+    use_force_words=False,
 ):
     desired_samples = num_samples
     data = []
     # print(f"generating {desired_samples} samples with max new tokens {max_length}")
 
-    bar = tqdm(total=desired_samples, leave=False, desc="Generating snippets")
+    bar = tqdm(total=desired_samples, leave=False, desc=f"Generating snippets use_force_words={use_force_words}...")
     # set seeds
     torch.manual_seed(seed)
     np.random.seed(seed)
-
+    word_ids = torch.tensor([*pattern], device=model.device).unsqueeze(0)
+    pattern_starts_with_bos = pattern[0] == tokenizer.bos_token_id
+    if pattern_starts_with_bos and use_force_words:
+        word_ids = word_ids[:, 1:]
     while len(data) < desired_samples:
+        if use_force_words:
+            random_prefix = model.generate(
+                torch.tensor([tokenizer.bos_token_id], device=model.device).unsqueeze(0),
+                do_sample=True,
+                max_length=5,
+                pad_token_id=tokenizer.eos_token_id,
+                bos_token_id=tokenizer.bos_token_id,
+            )
+
+            # if
         new_data = model.generate(
-            torch.tensor([*pattern], device=model.device).unsqueeze(0),
-            do_sample=True,
+            random_prefix if use_force_words else word_ids,
+            do_sample=not use_force_words,
+            num_beams=32,
             max_new_tokens=max_length,
             pad_token_id=tokenizer.eos_token_id,
             bos_token_id=tokenizer.bos_token_id,
             # top_k=50,
-            num_return_sequences=min(1000, desired_samples) if concat_every == -1 else min(concat_every * 100, desired_samples),
+            num_return_sequences=min(4 if not use_force_words else 1000, desired_samples)
+            if concat_every == -1
+            else min(concat_every * 100, desired_samples),
+            force_words_ids=word_ids.tolist() if use_force_words else None,
+            # no_repeat_ngram_size=1,
+            # remove_invalid_values=True,
+            # num_return_sequences=4,
         )
         if concat_every != -1:
             # concat every n samples into a single sample
@@ -648,7 +681,7 @@ def generate_samples_with_pattern(
         data.extend(new_data)
         bar.update(len(new_data))
     # print(len(data))
-    return [{"input_ids": i.unsqueeze(0)} for i in new_data]
+    return [{"input_ids": i.unsqueeze(0)} for i in data]
 
 
 def test_prefix_whitespace_when_adding_token(new_phrase, tokenizer: PreTrainedTokenizer):
