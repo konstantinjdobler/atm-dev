@@ -1,10 +1,9 @@
 import copy
 import itertools
 import time
-from typing import Generator, Iterable, Iterator
+from typing import Iterator
 
 import jaxtyping as typ
-import numpy as np
 import torch
 import torch.utils
 import torch.utils.data
@@ -18,12 +17,12 @@ from atm_utils import chunk_list
 LR = 0.01
 WD = 0.0
 BS = 5
-MBS = 200
+MBS = 250
 TARGET_LAYER = -1
 
 
 def create_trainable_atm_emb(new_phrase_ids, model_input_embedding: nn.Embedding, device=None, dtype=None):
-    initial_atm_emb = torch.mean(model_input_embedding(new_phrase_ids), dim=0)  # .to(torch.float32)
+    initial_atm_emb = torch.mean(model_input_embedding(new_phrase_ids), dim=0)
     if device is not None:
         initial_atm_emb = initial_atm_emb.to(device)
     if dtype is not None:
@@ -36,7 +35,7 @@ def batch_atm_for_many_tokens(
     new_phrases_train_snippets,
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
-    num_snippets_per_phrase=50,
+    num_snippets_per_phrase=50,  # TODO: get this from the data (a bit tricky becasue it might be a generator)
 ):
     """
     We need to be efficient, so we cannot just do the ATM optimization for each new token one by one.
@@ -48,7 +47,7 @@ def batch_atm_for_many_tokens(
         param.requires_grad = False
     model_input_embs_cpu = copy.deepcopy(model.get_input_embeddings()).cpu()
 
-    # init atm embs as mean of constituent tokens (FVT-style). cast to float32 to avoid numerical issues -- we cast to bfloat16 in the fwd pass if necessary
+    # init atm embs as mean of constituent tokens (FVT-style). cast to float32 to avoid numerical issues during opt step -- we cast to bfloat16 in the fwd pass if necessary
     new_phrases_trainable_atm_embs = [
         create_trainable_atm_emb(new_phrase_ids, model_input_embs_cpu, DEVICE, torch.float32)
         for new_phrase_ids in new_phrases_ids
@@ -87,9 +86,6 @@ def batch_atm_for_many_tokens(
         optimizer = torch.optim.AdamW(cur_new_phrase_atm_embs, lr=LR, weight_decay=WD)
         optimizer.zero_grad()
         NUM_OPT_STEPS = num_snippets_per_phrase // BS
-        # if cur_phrases_idxs[0] > 0:
-        #     # `batched_dataset.num_snippets_per_phrase()` is not available until the first batch is processed
-        #     assert num_snippets_per_phrase == batched_dataset.num_snippets_per_phrase()
         cur_opt_step = 1
         scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=int(NUM_OPT_STEPS * 0.5))
         fwd_pass_bar = tqdm(
@@ -109,7 +105,7 @@ def batch_atm_for_many_tokens(
             cur_snippet_idx = batch["snippet_idx"]
             assert cur_snippet_idx > last_snippet_idx
             last_snippet_idx = cur_snippet_idx
-            batch["snippets_toks"] = batch["snippets_toks"].to(DEVICE, non_blocking=True)
+            batch["snippets_token_ids"] = batch["snippets_token_ids"].to(DEVICE, non_blocking=True)
             batch["padded_atm_seqs_embs"] = batch["padded_atm_seqs_embs"].to(DEVICE, non_blocking=True)
 
             assert batch["phrases_idxs"] == cur_phrases_idxs
@@ -122,20 +118,18 @@ def batch_atm_for_many_tokens(
             assert batch["padded_atm_seqs_embs"][0, batch["new_phrase_in_atm_seq_idxs"][0]].requires_grad
             data_fetch_t1 = time.perf_counter()
             total_data_fetch_time += data_fetch_t1 - data_fetch_t0
-            # print(f"Data fetch time: {data_fetch_t1 - data_fetch_t0:.4f}")
 
-            # with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
             # ground truth forward pass - no_grad!
             with torch.no_grad():
                 out = model(
-                    batch["snippets_toks"],
+                    batch["snippets_token_ids"],
                     output_hidden_states=True,
                     return_dict=True,
                 )
                 batched_gt_hiddens = out["hidden_states"][TARGET_LAYER]
                 del out
 
-            # forward pass with the merged pattern
+            # forward pass where we replace multiple input tokens with their single ATM embeddings
             out = model(
                 inputs_embeds=batch["padded_atm_seqs_embs"],
                 output_hidden_states=True,
@@ -146,8 +140,7 @@ def batch_atm_for_many_tokens(
 
             # remove padding
             batched_phrase_snippets_atm_hiddens = [
-                t[: batch["padded_atm_seqs_embs_orig_lengths"][i], :]
-                for i, t in enumerate(batched_phrase_snippets_atm_hiddens)
+                t[: batch["padded_atm_seqs_embs_orig_lengths"][i], :] for i, t in enumerate(batched_phrase_snippets_atm_hiddens)
             ]
 
             assert len(batched_gt_hiddens) == len(batched_phrase_snippets_atm_hiddens)
@@ -159,7 +152,7 @@ def batch_atm_for_many_tokens(
                     new_phrases_ids[cur_phrases_idxs[i]].size(0) - 1
                 ) * len(batch["new_phrase_in_gt_seq_idxs"][i])
 
-            # align gt sequence hiddens and atm merged sequence hiddens
+            # align gt (ground-truth) sequence hiddens and atm merged sequence hiddens (since in gt, we have multiple tokens for each ATM emb in the ATM sequence)
             batched_non_pattern_hiddens_gt, batched_non_pattern_hiddens_merged = [], []
             batched_pattern_last_hiddens_gt, batched_pattern_hiddens_merged = [], []
 
@@ -174,7 +167,7 @@ def batch_atm_for_many_tokens(
                     non_pattern_hiddens_merged,
                     pattern_last_hiddens_gt,
                     pattern_hiddens_merged,
-                ) = align_hidden_states_w_merged_pattern(
+                ) = align_gt_and_atm_hidden_states(
                     gt_hiddens,
                     atm_hiddens,
                     patterns_in_gt_seq_idx,
@@ -188,10 +181,11 @@ def batch_atm_for_many_tokens(
                 batched_pattern_last_hiddens_gt.append(pattern_last_hiddens_gt)
                 batched_pattern_hiddens_merged.append(pattern_hiddens_merged)
 
+            # calculate MSE -- we want to force all hiddens in the ATM sequence to mimic the hidden states of the gt sequences where the ATM embedding is split into its multiple tokens
             all_hiddens_gt = torch.cat(batched_non_pattern_hiddens_gt + batched_pattern_last_hiddens_gt)
             all_hiddens_merged = torch.cat(batched_non_pattern_hiddens_merged + batched_pattern_hiddens_merged)
             error = loss_fn(all_hiddens_merged, all_hiddens_gt) / BS
-            error.backward(inputs=cur_new_phrase_atm_embs)
+            error.backward(inputs=cur_new_phrase_atm_embs)  # backward only for the ATM embs
 
             avg_cur_step_error += error.item()
 
@@ -242,9 +236,9 @@ def batch_atm_for_many_tokens(
                 )
                 fwd_pass_bar.set_description(f"Fwd passes (Step {cur_opt_step}/{NUM_OPT_STEPS})...")
                 avg_cur_step_error = 0
-    # avg_error_per_opt_step = [e / (NUM_PHRASES // MBS) for e in avg_error_per_opt_step]
     import matplotlib.pyplot as plt
 
+    stats_per_opt_step = [{k: v / (NUM_PHRASES // MBS) for k, v in s.items()} for s in stats_per_opt_step]
     # do 5 different line plots for the stats_per_opt_step on top of each other
     # do it in a single fig with subplots, share x axis
     # make sure the y axis is trimmed to the range of the values
@@ -277,15 +271,13 @@ class BatchedSnippetDataset(torch.utils.data.IterableDataset):
         self,
         new_phrases_ids: list[list[int]],
         new_phrases_train_snippets: Iterator[list[list[typ.Int[torch.Tensor, "token_ids"]]]],
-        # new_phrases_trainable_atm_embs: list[nn.Parameter],
         model_input_embedding: nn.Embedding,
         batch_size=10,
     ):
         self.new_phrases_ids = new_phrases_ids
         if not hasattr(new_phrases_train_snippets, "__next__"):
-            new_phrases_train_snippets = iter(new_phrases_train_snippets)
+            new_phrases_train_snippets = iter(new_phrases_train_snippets)  # convert to generator if not already
         self.new_phrases_train_snippets = new_phrases_train_snippets
-        # self.new_phrases_trainable_atm_embs = new_phrases_trainable_atm_embs
         self.atm_emb_placeholder = torch.zeros_like(model_input_embedding.weight[0])
         self.model_input_embedding = model_input_embedding
         assert model_input_embedding.weight.device.type == "cpu"
@@ -308,9 +300,7 @@ class BatchedSnippetDataset(torch.utils.data.IterableDataset):
                 else:
                     break
 
-        # training_batch_inputs = []
         phrase_counter = 0
-
         # Get `self.batch_size` number of phrases and their snippets at a time
         for cur_phrases_train_snippets in chunk_generator(self.new_phrases_train_snippets, self.batch_size):
             cur_phrases_idxs = list(range(phrase_counter, phrase_counter + len(cur_phrases_train_snippets)))
@@ -324,55 +314,46 @@ class BatchedSnippetDataset(torch.utils.data.IterableDataset):
             # Iterate over their snippets in parallel and collate s.t. each batch has the snippets at `snippet_idx` from each phrase
             for snippet_idx in range(max_num_snippets):
                 cur_batch = {
-                    "snippets_toks": torch.stack(
-                        [phrase_snippets_toks[snippet_idx] for phrase_snippets_toks in cur_phrases_train_snippets]
+                    "snippets_token_ids": torch.stack(
+                        [snippets_token_ids[snippet_idx] for snippets_token_ids in cur_phrases_train_snippets]
                     ),
                     "phrases_idxs": cur_phrases_idxs,
-                    "phrases_toks": [self.new_phrases_ids[pi] for pi in cur_phrases_idxs],
+                    "phrases_token_ids": [self.new_phrases_ids[pi] for pi in cur_phrases_idxs],
                     "snippet_idx": snippet_idx,
                 }
                 yield cur_batch
 
     @torch.no_grad()
     def __iter__(self):
-        # Need to handle the multiple workers case
+        _iter = self._training_batch_w_atm_seq_embs_iter()
+
+        # Need to handle the multiple workers case for __iter__ dataset, see https://discuss.pytorch.org/t/iterable-pytorch-dataset-with-multiple-workers/135475/3
         worker_total_num = torch.utils.data.get_worker_info().num_workers
         worker_id = torch.utils.data.get_worker_info().id
-
-        _iter = self._training_batch_iter()
         workerified_iter = itertools.islice(_iter, worker_id, None, worker_total_num)
         return workerified_iter
 
     @torch.no_grad()
-    def _training_batch_iter(self):
+    def _training_batch_w_atm_seq_embs_iter(self):
         """
         Additionally to the token input ids, we need to provide embedding sequbces for the ATM forward pass.
+        We do all this here in the dataset, so that we can offload this work from the main process by using a DataLoader with multiple workers.
         """
 
-        for i, batch in enumerate(self._collate_phrase_snippets_into_batches()):
-            phrases_idxs = batch["phrases_idxs"]
-            batched_new_phrase_snippet_token_ids = batch["snippets_toks"]
-
+        for batch in self._collate_phrase_snippets_into_batches():
             batched_snippet_embs_w_atm = []
             batched_phrase_in_atm_seq_idxs = []
             batched_phrase_in_gt_seq_idxs = []
-            for j in range(len(phrases_idxs)):
-                new_phrase_tokenized_ids = batch["phrases_toks"][j]
-                new_phrase_atm_emb = torch.full_like(self.atm_emb_placeholder, -100)
-                new_phrase_snippet_token_ids = batched_new_phrase_snippet_token_ids[j]
-                (
-                    sample_embs_w_merged_pattern,
-                    patterns_in_merged_seq_idx,
-                    patterns_in_gt_seq_idx,
-                ) = construct_merged_emb_inputs(
-                    new_phrase_snippet_token_ids,
-                    new_phrase_tokenized_ids,
-                    new_phrase_atm_emb,
-                    self.model_input_embedding,
+            for j in range(len(batch["phrases_idxs"])):
+                phrase_tokenized_ids = batch["phrases_token_ids"][j]
+                phrase_atm_emb = torch.full_like(self.atm_emb_placeholder, -100)
+                phrase_snippet_token_ids = batch["snippets_token_ids"][j]
+                (atm_sequence_embs, phrase_in_atm_seq_idxs, phrase_in_gt_seq_idxs) = construct_atm_input_sequence(
+                    phrase_snippet_token_ids, phrase_tokenized_ids, phrase_atm_emb, self.model_input_embedding
                 )
-                batched_snippet_embs_w_atm.append(sample_embs_w_merged_pattern)
-                batched_phrase_in_atm_seq_idxs.append(patterns_in_merged_seq_idx)
-                batched_phrase_in_gt_seq_idxs.append(patterns_in_gt_seq_idx)
+                batched_snippet_embs_w_atm.append(atm_sequence_embs)
+                batched_phrase_in_atm_seq_idxs.append(phrase_in_atm_seq_idxs)
+                batched_phrase_in_gt_seq_idxs.append(phrase_in_gt_seq_idxs)
 
             padded_batched_atm_seqs_embs = pad_sequence(
                 batched_snippet_embs_w_atm,
@@ -388,36 +369,44 @@ class BatchedSnippetDataset(torch.utils.data.IterableDataset):
             yield batch
 
 
-def construct_merged_emb_inputs(sample_token_ids, pattern, pattern_emb, input_embs):
-    sample_embs_w_merged_pattern = []
-    patterns_in_merged_seq_idx = []
-    patterns_in_gt_seq_idx = []
+def construct_atm_input_sequence(snippet_token_ids, phrase_tokens, phrase_atm_emb, model_input_embs):
+    """
+    Input: input sequence of token ids (`snippet_token_ids`), which contains the token ids for `phrase`.
+    Return the embedded sequence where the tokens in `phrase` are replaced by a single ATM embedding.
+    Also returns indices of occurences of the phrase in both sequences.
+    """
+    atm_input_sequence = []
+    phrase_in_atm_seq_idxs = []
+    phrase_in_gt_seq_start_idxs = []
     cur_tok_id_idx = 0
-    while cur_tok_id_idx < (len(sample_token_ids)):
-        if torch.equal(sample_token_ids[cur_tok_id_idx : cur_tok_id_idx + pattern.size(0)], pattern):
-            sample_embs_w_merged_pattern.append(pattern_emb.to(input_embs.weight.dtype))
-            patterns_in_gt_seq_idx.append(cur_tok_id_idx)
-            patterns_in_merged_seq_idx.append(len(sample_embs_w_merged_pattern) - 1)
-            cur_tok_id_idx += pattern.size(0)
+    while cur_tok_id_idx < (len(snippet_token_ids)):
+        if torch.equal(snippet_token_ids[cur_tok_id_idx : cur_tok_id_idx + phrase_tokens.size(0)], phrase_tokens):
+            atm_input_sequence.append(phrase_atm_emb.to(model_input_embs.weight.dtype))
+            phrase_in_gt_seq_start_idxs.append(cur_tok_id_idx)
+            phrase_in_atm_seq_idxs.append(len(atm_input_sequence) - 1)
+            cur_tok_id_idx += phrase_tokens.size(0)
         else:
-            emb = input_embs(sample_token_ids[cur_tok_id_idx])
-            sample_embs_w_merged_pattern.append(emb)
+            emb = model_input_embs(snippet_token_ids[cur_tok_id_idx])
+            atm_input_sequence.append(emb)
             cur_tok_id_idx += 1
-    sample_embs_w_merged_pattern = torch.stack(sample_embs_w_merged_pattern)
+    atm_input_sequence = torch.stack(atm_input_sequence)
     return (
-        sample_embs_w_merged_pattern,
-        patterns_in_merged_seq_idx,
-        patterns_in_gt_seq_idx,
+        atm_input_sequence,
+        phrase_in_atm_seq_idxs,
+        phrase_in_gt_seq_start_idxs,
     )
 
 
-def align_hidden_states_w_merged_pattern(
+def align_gt_and_atm_hidden_states(
     gt_hiddens,
     atm_hiddens,
     patterns_in_gt_seq_idx,
     patterns_in_merged_seq_idx,
     new_phrase_ids_len,
 ):
+    """
+    Since in the ATM sequence, we merge multiple tokens into a single ATM embedding, we need to align the hidden states of the ATM sequence with the ground-truth sequence.
+    """
     full_pattern_indices_in_gt = []
     for idx in patterns_in_gt_seq_idx:
         full_pattern_indices_in_gt.extend(range(idx, idx + new_phrase_ids_len))
