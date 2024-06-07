@@ -261,10 +261,11 @@ def batch_atm_for_many_tokens(
         cur_initial_new_phrase_atm_embs = [new_phrases_trainable_atm_embs[i].clone().detach() for i in cur_phrases_idxs]
 
         optimizer = torch.optim.AdamW(cur_new_phrase_atm_embs, lr=LR, weight_decay=WD)
+        optimizer.zero_grad()
         NUM_OPT_STEPS = num_snippets_per_phrase // BS
-        if cur_phrases_idxs[0] > 0:
-            # `batched_dataset.num_snippets_per_phrase()` is not available until the first batch is processed
-            assert num_snippets_per_phrase == batched_dataset.num_snippets_per_phrase()
+        # if cur_phrases_idxs[0] > 0:
+        #     # `batched_dataset.num_snippets_per_phrase()` is not available until the first batch is processed
+        #     assert num_snippets_per_phrase == batched_dataset.num_snippets_per_phrase()
         cur_opt_step = 1
         scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=int(NUM_OPT_STEPS * 0.3))
         fwd_pass_bar = tqdm(
@@ -379,6 +380,7 @@ def batch_atm_for_many_tokens(
                 # pre_clip_grad_norm = torch.norm(cur_new_phrase_atm_embs.grad).item()
                 avg_cur_step_error /= BS
                 avg_error_per_opt_step[cur_opt_step - 1] += avg_cur_step_error  # 0-indexing but cur_opt_step started at 1
+                
                 avg_pre_clip_grad_norm = torch.norm(torch.stack([emb.grad for emb in cur_new_phrase_atm_embs]), dim=-1).mean()
                 torch.nn.utils.clip_grad_norm_(cur_new_phrase_atm_embs, 1.0)
                 optimizer.step()
@@ -390,7 +392,7 @@ def batch_atm_for_many_tokens(
 
                 with torch.no_grad():
                     avg_diff_norms_to_initial = (
-                        torch.norm(torch.stack(cur_new_phrase_atm_embs) - torch.stack(cur_initial_new_phrase_atm_embs))
+                        torch.norm(torch.stack(cur_new_phrase_atm_embs) - torch.stack(cur_initial_new_phrase_atm_embs), dim=-1)
                         .mean()
                         .item()
                     )
@@ -398,11 +400,12 @@ def batch_atm_for_many_tokens(
                         cosine_similarity(
                             torch.stack(cur_new_phrase_atm_embs),
                             torch.stack(cur_initial_new_phrase_atm_embs),
+                            dim=-1
                         )
                         .mean()
                         .item()
                     )
-                    avg_atm_emb_norms = torch.norm(torch.stack(cur_new_phrase_atm_embs), dim=1).mean().item()
+                    avg_atm_emb_norms = torch.norm(torch.stack(cur_new_phrase_atm_embs), dim=-1).mean().item()
 
                 # avg_error_hist.append(avg_error_for_step)
 
