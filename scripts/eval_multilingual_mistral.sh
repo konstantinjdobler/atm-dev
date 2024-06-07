@@ -113,24 +113,24 @@ do
     #     --lang_code=$lang \
     #     $EXTRA_ARGS
 
-    python transfer_atm.py \
-        --model_path=$target_model \
-        --tokenizer=$tokenizer_path \
-        --out_path=$atm_out_path
+    # python transfer_atm.py \
+    #     --model_path=$target_model \
+    #     --tokenizer=$tokenizer_path \
+    #     --out_path=$atm_out_path
      
 
 
-    # baseline
-    lm_eval --model hf \
-        --model_args pretrained=$target_model,dtype="bfloat16" \
-        --tasks m_mmlu_$lang \
-        --num_fewshot 5 \
-        --device cuda:0 \
-        --batch_size 4
+    # # baseline
+    # lm_eval --model hf \
+    #     --model_args pretrained=$target_model,dtype="bfloat16" \
+    #     --tasks m_mmlu_$lang \
+    #     --num_fewshot 5 \
+    #     --device cuda:0 \
+    #     --batch_size 4
 
     # ours
     lm_eval --model hf \
-        --model_args pretrained=$atm_out_path,dtype="bfloat16" \
+        --model_args pretrained=./testdata,dtype="bfloat16" \
         --tasks m_mmlu_$lang \
         --num_fewshot 5 \
         --device cuda:0 \

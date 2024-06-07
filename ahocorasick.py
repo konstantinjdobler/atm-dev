@@ -102,7 +102,7 @@ def collect_snippets_with_patterns_from_dataset(
         print(f"\n\n--------------\nStarting iteration {iter_counter} with {proc_bs} documents\n\n----------")
         data_fetch_t0 = time.perf_counter()
         print("Fetching data...")
-        batch = dataset.select(list(range(total_docs_processed, total_docs_processed + proc_bs)))["tokens"]
+        batch = dataset.select(list(range(total_docs_processed, total_docs_processed + proc_bs)), keep_in_memory=True)["tokens"]
         data_fetch_t1 = time.perf_counter()
         print(f"Data fetch time: {data_fetch_t1 - data_fetch_t0:.4f} seconds")
 

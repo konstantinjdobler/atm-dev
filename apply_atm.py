@@ -13,15 +13,28 @@ from transformers import (
 )
 
 from ahocorasick import collect_snippets_with_patterns_from_dataset, hash_int_seq
-from atm import batch_atm_for_many_tokens, get_new_phrase_tokenized_ids
+from atm import batch_atm_for_many_tokens
+from atm_utils import SPIECE_WHITESPACE, get_new_phrase_tokenized_ids
+
+DATA_SUFFIX = "german"
 
 
 def tokenization_generator(tokenizer, hf_dataset, batch_size=16_000):
-    if os.path.exists("./tokenized_dataset/"):
+    if os.path.exists(f"./tokenized_dataset_{DATA_SUFFIX}/"):
         # ds = Dataset.load_from_disk("./tokenized_dataset/")
         # yield from ds.iter(batch_size=1)
         return
-    dataset = load_dataset("uonlp/CulturaX", "de", split="train", streaming=True)
+    if DATA_SUFFIX == "german":
+        dataset = load_dataset("uonlp/CulturaX", "de", split="train", streaming=True)
+    else:
+        dataset = load_dataset("ncbi/pubmed", split="train", streaming=True)
+        dataset = dataset.map(
+            lambda x: {"text": x["MedlineCitation"]["Article"]["Abstract"]["AbstractText"]},
+            batched=False,
+            # batch_size=batch_size,
+            remove_columns=dataset.column_names,
+        )
+        "MedlineCitation" > "Article" > "Abstract" > "AbstractText"
 
     tokenized_dataset = dataset.map(
         lambda x: {"tokens": tokenizer(x["text"], truncation=False, padding=False, add_special_tokens=False)["input_ids"]},
@@ -38,7 +51,7 @@ def tokenization_generator(tokenizer, hf_dataset, batch_size=16_000):
         features=tokenized_dataset.features,
     )
 
-    ds.save_to_disk("./tokenized_dataset/")
+    ds.save_to_disk(f"./tokenized_dataset_{DATA_SUFFIX}/")
 
     # yield from ds.to_iterable_dataset()
 
@@ -48,6 +61,11 @@ def main(
     tokenizer: str = "./tokenizers/de/de32k/",
     out_path: str = "./testdata/",
 ):
+    global DATA_SUFFIX
+    if "de32k" in tokenizer:
+        DATA_SUFFIX = "german"
+    else:
+        DATA_SUFFIX = "pubmed"
     # torch.set_default_device("cuda:0")  # TODO: fix this better
     torch.set_float32_matmul_precision("high")
     source_tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False, add_prefix_space=False, from_slow=True)
@@ -57,13 +75,14 @@ def main(
     )
     # MistralForCausalLM
     model.compile()
-    model(torch.randint(10, 300, (10,10)).long().cuda())
+    # model(torch.randint(10, 300, (10,10)).long().cuda())
 
     new_vocab = {}
     source_vocab = source_tokenizer.get_vocab()
     target_vocab = sorted(target_tokenizer.get_vocab().items())
     todo_tokens = []
     for token, token_id in tqdm(target_vocab):
+        token = token.replace("Ġ", SPIECE_WHITESPACE)
         if source_vocab.get(token) is not None:
             new_vocab[token_id] = model.get_input_embeddings().weight[source_vocab[token]]
             # print(f"Found {token} in source vocab")
@@ -76,21 +95,24 @@ def main(
     # new_vocab[token_id] = atm_embedding
 
     # get data snippets for new tokens
+
     source_tokenizer_fast = AutoTokenizer.from_pretrained(model_path, use_fast=True)
     patterns_ids = [get_new_phrase_tokenized_ids(t[0], source_tokenizer)[0] for t in todo_tokens]
+    stopping_cond = "num_docs:1_000_000"
+    snippet_cache = f"collected_snippets_{DATA_SUFFIX}_{stopping_cond}.pkl"
 
-    if os.path.exists("collected_snippets2.pkl"):
-        with open("collected_snippets2.pkl", "rb") as f:
+    if os.path.exists(snippet_cache):
+        with open(snippet_cache, "rb") as f:
             collected_snippets = pickle.load(f)
     else:
         tokenization_generator(source_tokenizer_fast, None, batch_size=16_000)
-        dataset = Dataset.load_from_disk("./tokenized_dataset/")
+        dataset = Dataset.load_from_disk(f"./tokenized_dataset_{DATA_SUFFIX}/")
         collected_snippets = collect_snippets_with_patterns_from_dataset(
-            patterns_ids, source_tokenizer_fast, dataset, stopping_condition="num_docs:500"
+            patterns_ids, source_tokenizer_fast, dataset, stopping_condition=stopping_cond
         )
 
         # save collected snippets
-        with open("collected_snippets2.pkl", "wb") as f:
+        with open(snippet_cache, "wb") as f:
             pickle.dump(collected_snippets, f)
     print("Collected snippets for all tokens")
 
@@ -99,6 +121,7 @@ def main(
     new_phrases_ids = []
     new_phrases_snippets_ids = []
     new_phrases_token_ids_in_target_vocab = []
+    todo_tokens_not_enough_snippets = []
     for token, token_id in tqdm(
         sorted(
             todo_tokens,
@@ -108,6 +131,7 @@ def main(
         snippets = collected_snippets[hash_int_seq(get_new_phrase_tokenized_ids(token, source_tokenizer)[0])]
         if len(snippets) < 50:
             # print(f"Only {len(snippets)} snippets for {token}")
+            todo_tokens_not_enough_snippets.append((token, token_id))
             continue
         snippets = [s[0][s[1] : s[1] + 50] for s in snippets]
         snippets = [[source_tokenizer.bos_token_id] + s[:50] for s in snippets if len(s) >= 50][:50]
@@ -117,6 +141,7 @@ def main(
         # print(f"Found {len(snippets)} snippets for {token}")
         if len(snippets) < 50:
             # print(f"Only {len(snippets)} snippets for {token}")
+            todo_tokens_not_enough_snippets.append((token, token_id))
             continue
         # atm_embedding = atm_merge_token(model, token, snippets)
         # atm_embedding = atm_merge_token(token, source_tokenizer, model, train_snippets=snippets, eval=False)
@@ -130,6 +155,22 @@ def main(
 
     for token_id, atm_embedding in zip(new_phrases_token_ids_in_target_vocab, new_phrases_atm_embs):
         new_vocab[token_id] = atm_embedding
+
+    for token, token_id in todo_tokens_not_enough_snippets:
+        # init as mean of constituent tokens
+        embs = model.get_input_embeddings()
+        token_ids = get_new_phrase_tokenized_ids(token, source_tokenizer)[0].to(embs.weight.device)
+        new_vocab[token_id] = torch.mean(embs(token_ids), dim=0)
+
+    # handle BOS EOS PAD and UNK
+    if target_tokenizer.bos_token_id:
+        new_vocab[target_tokenizer.bos_token_id] = model.get_input_embeddings().weight[source_tokenizer.bos_token_id]
+    if target_tokenizer.eos_token_id:
+        new_vocab[target_tokenizer.eos_token_id] = model.get_input_embeddings().weight[source_tokenizer.eos_token_id]
+    if target_tokenizer.pad_token_id:
+        new_vocab[target_tokenizer.pad_token_id] = model.get_input_embeddings().weight[source_tokenizer.pad_token_id]
+    if target_tokenizer.unk_token_id:
+        new_vocab[target_tokenizer.unk_token_id] = model.get_input_embeddings().weight[source_tokenizer.unk_token_id]
 
     model.config.tie_word_embeddings = True  # hack s.t. only input embedding is resized
     model.resize_token_embeddings(len(target_tokenizer))

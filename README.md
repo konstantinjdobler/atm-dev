@@ -8,7 +8,9 @@ You can install `rye` with the following snippet (Linux/MacOS):
 curl -sSf https://rye.astral.sh/get | bash
 ```
 
-The run `rye sync --no-lock --force` to install the dependencies from our `requirements.lock`. The dependencies are installed in `.venv/`. You can actiavte the virtual environment with `source .venv/bin/activate`.
+The run `rye sync --no-lock --force` to install the dependencies from our `requirements.lock`. The dependencies are installed in `.venv/`. 
+`rye` automatically shims `python` to use the virtual environment inside the project folder.
+You can also activate the virtual environment with `source .venv/bin/activate`.
 
 ## Running ATM
 ```sh

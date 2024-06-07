@@ -1,6 +1,8 @@
 .venv/
 collected_snippets*.pkl
 testdata/
+tokenized_dataset*/
+stats_per_opt_step*.png
 
 runs/
 coms/
