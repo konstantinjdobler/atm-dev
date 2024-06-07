@@ -1,0 +1,36 @@
+[project]
+name = "atm-dev"
+version = "0.1.0"
+description = "Save money by using an ATM (Attention-aware Token Merging)."
+authors = [{ name = "Konstantin Dobler", email = "konstantin.dobler@hpi.de" }]
+dependencies = [
+    "datasets>=2.19.1",
+    "numpy>=1.26.3",
+    "tqdm>=4.64.1",
+    "transformers>=4.41.2",
+    "fire>=0.6.0",
+    "ahocorasick-rs>=0.22.0",
+    "torch==2.3.1+cu121",
+    "sentencepiece>=0.2.0",
+    "protobuf>=5.27.0",
+    "accelerate>=0.30.1",
+    "jaxtyping>=0.2.29",
+]
+readme = "README.md"
+requires-python = ">= 3.11"
+
+[tool.rye]
+managed = true
+virtual = true
+dev-dependencies = []
+lock-with-sources = true
+use-uv = true
+
+[tool.ruff]
+line-length = 128
+ignore = ["F821"]
+
+[[tool.rye.sources]]
+name = "pytorch"
+type = "index"
+url = "https://download.pytorch.org/whl/cu121"
