@@ -1,5 +1,5 @@
 .venv/
-collecetd_snippets*.pkl
+collected_snippets*.pkl
 testdata/
 
 runs/

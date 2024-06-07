@@ -18,8 +18,8 @@ from atm import batch_atm_for_many_tokens, get_new_phrase_tokenized_ids
 
 def tokenization_generator(tokenizer, hf_dataset, batch_size=16_000):
     if os.path.exists("./tokenized_dataset/"):
-        ds = Dataset.load_from_disk("./tokenized_dataset/")
-        yield from ds.iter(batch_size=1)
+        # ds = Dataset.load_from_disk("./tokenized_dataset/")
+        # yield from ds.iter(batch_size=1)
         return
     dataset = load_dataset("uonlp/CulturaX", "de", split="train", streaming=True)
 
@@ -56,7 +56,7 @@ def main(
         model_path, attn_implementation="sdpa", torch_dtype=torch.bfloat16, device_map="cuda:0"
     )
     # MistralForCausalLM
-    # model.compile()
+    model.compile()
 
     new_vocab = {}
     source_vocab = source_tokenizer.get_vocab()
@@ -91,7 +91,6 @@ def main(
         # save collected snippets
         with open("collected_snippets2.pkl", "wb") as f:
             pickle.dump(collected_snippets, f)
-    # ll = [(token, token_id, len(collected_snippets[hash_int_seq(get_new_phrase_tokenized_ids(token, source_tokenizer)[0])])) for token, token_id in todo_tokens]
     print("Collected snippets for all tokens")
 
     

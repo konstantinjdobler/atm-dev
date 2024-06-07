@@ -250,6 +250,8 @@ def batch_atm_for_many_tokens(
         desc=f"ATM for {NUM_PHRASES} new phrases",
         total=NUM_PHRASES // MBS,
     )
+    avg_error_per_opt_step = [0 for _ in range(num_snippets_per_phrase // BS)]
+
     for cur_phrases_idxs in phrases_bar:
         cur_phrases_idxs = list(cur_phrases_idxs)
         cur_phrases_tokens = ["".join(tokenizer.convert_ids_to_tokens(new_phrases_ids[i])) for i in cur_phrases_idxs]
@@ -375,6 +377,8 @@ def batch_atm_for_many_tokens(
 
             if (fwdpass_idx + 1) % BS == 0:
                 # pre_clip_grad_norm = torch.norm(cur_new_phrase_atm_embs.grad).item()
+                avg_cur_step_error /= BS
+                avg_error_per_opt_step[cur_opt_step - 1] += avg_cur_step_error  # 0-indexing but cur_opt_step started at 1
                 avg_pre_clip_grad_norm = torch.norm(torch.stack([emb.grad for emb in cur_new_phrase_atm_embs]), dim=-1).mean()
                 torch.nn.utils.clip_grad_norm_(cur_new_phrase_atm_embs, 1.0)
                 optimizer.step()
@@ -401,7 +405,7 @@ def batch_atm_for_many_tokens(
                     avg_atm_emb_norms = torch.norm(torch.stack(cur_new_phrase_atm_embs), dim=1).mean().item()
 
                 # avg_error_hist.append(avg_error_for_step)
-                avg_cur_step_error /= BS
+
                 ema_error = avg_cur_step_error if ema_error is None else 0.5 * ema_error + 0.5 * avg_cur_step_error
                 fwd_pass_bar.set_postfix(
                     {
@@ -415,7 +419,10 @@ def batch_atm_for_many_tokens(
                     }
                 )
                 avg_cur_step_error = 0
-
+    avg_error_per_opt_step = [e / (NUM_PHRASES // MBS) for e in avg_error_per_opt_step]
+    import matplotlib.pyplot as plt
+    plt.plot(avg_error_per_opt_step)
+    plt.savefig("avg_error_per_opt_step.png")
     return new_phrases_trainable_atm_embs
 
 
